@@ -35,8 +35,24 @@ const paperSchema = new mongoose.Schema({
     views: {
         type: Number,
         default: 0 
-    }
+    },
+    source: {
+      type: String,
+      default: "arXiv",
+      trim: true,
+    },
+    externalId: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    publishedAt: {
+      type: Date,
+      required: false,
+    },
 }, {timestamps: true});
+
+paperSchema.index({ source: 1, externalId: 1 }, { unique: true });
 
 const Paper = mongoose.model("Paper", paperSchema);
 
