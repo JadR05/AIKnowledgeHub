@@ -174,7 +174,7 @@ function HomePage({ navigate }) {
         <div className="hero-panel__stats">
           <div className="stat-card">
             <span className="stat-card__label">Reading flow</span>
-            <strong>Home -> paper page</strong>
+            <strong>Home →  paper page</strong>
             <p>Each card opens a dedicated route so the user can read the paper details.</p>
           </div>
           <div className="stat-card">
