@@ -506,15 +506,281 @@ aws dynamodb put-item --table-name aikhub-subscriptions --region eu-west-1 \
 
 Remember: SES accounts start in the \emph{sandbox}, where the recipient address must also be verified. Request production access via the SES dashboard to send to arbitrary recipients.
 
-\subsection{Swapping Bedrock models}
-The Converse API makes this a one-line change in \texttt{terraform.tfvars}:
+\section{Test Execution and Results}
+
+The following tests were executed against a live deployment in \texttt{eu-west-1} on 2026-04-15/16. All AWS resources were provisioned via \texttt{terraform apply} (44 resources initial deploy, 3 added + 5 changed after the DynamoDB migration).
+
+\subsection{Test 1: Scraper --- arXiv ingestion}
+
+\textbf{Method:} Invoked the scraper Lambda directly.
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws lambda invoke --function-name aikhub-scraper-processor \
+  --region eu-west-1 --payload '{}' \
+  --cli-binary-format raw-in-base64-out /tmp/scraper.json
+\end{lstlisting}
+
+\textbf{Result:} \texttt{StatusCode: 200}. DynamoDB scan confirmed \textbf{27 papers} inserted into \texttt{aikhub-papers} table. Each paper had \texttt{externalId}, \texttt{title}, \texttt{summary}, \texttt{topic}, \texttt{topics}, \texttt{pdfUrl}, and \texttt{createdAt} populated. SQS message sent to \texttt{aikhub-paper-processing} queue triggering the ai-processor.
+
+\textbf{Verdict:} \textcolor{green!60!black}{\textbf{PASS}}
+
+\subsection{Test 2: AI Processor --- summary generation + audio}
+
+\textbf{Method:} Bedrock daily token quota was exhausted on the new AWS account, so a local Ollama (llama3) script was used as a drop-in replacement. The script mirrors the Lambda's exact behaviour: query DynamoDB for unprocessed papers, generate summary, synthesize audio via Polly, upload MP3 to S3, update DynamoDB.
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+MAX_PAPERS=3 TOPIC=NLP node scripts/local-ai-processor.mjs
+\end{lstlisting}
+
+\textbf{Result:}
+\begin{itemize}[leftmargin=*]
+  \item 3 papers processed (\texttt{2604.13018v1}, \texttt{2604.13016v1}, \texttt{2604.12911v1})
+  \item Summaries: 637, 661, 765 characters respectively
+  \item Audio files: 248\,KB, 235\,KB, 265\,KB (Polly neural, Joanna voice)
+  \item S3 upload confirmed: \texttt{s3://aikhub-audio-summaries/audio/<id>.mp3}
+  \item DynamoDB updated: \texttt{aiSummary} and \texttt{audioUrl} fields populated
+\end{itemize}
+
+\textbf{Verdict:} \textcolor{green!60!black}{\textbf{PASS}} (Polly, S3, and DynamoDB used real AWS; only the LLM call was local)
+
+\subsection{Test 3: Subscription Processor --- fan-out to email queue}
+
+\textbf{Method:} Seeded a test subscriber, then invoked the subscription Lambda.
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws dynamodb put-item --table-name aikhub-subscriptions \
+  --region eu-west-1 \
+  --item '{"email":{"S":"muhammad.kobeissi@gmail.com"},
+           "subscribedTopics":{"L":[{"S":"NLP"}]}}'
+
+aws lambda invoke --function-name aikhub-subscription-processor \
+  --region eu-west-1 --payload '{}' \
+  --cli-binary-format raw-in-base64-out /tmp/out.json
+\end{lstlisting}
+
+\textbf{Result:} \texttt{StatusCode: 200}, \texttt{\{"success":true\}}. CloudWatch logs showed 859\,ms execution, no errors. Message enqueued to \texttt{aikhub-email-processing} for the email-sender.
+
+\textbf{Verdict:} \textcolor{green!60!black}{\textbf{PASS}}
+
+\subsection{Test 4: Email Sender --- SES delivery}
+
+\textbf{Method:} Triggered automatically by the SQS message from Test~3.
+
+\textbf{Initial result:} \texttt{ERROR: p.topic.join is not a function}. Root cause: scraper writes \texttt{topic} as a string, but the email template called \texttt{p.topic.join(", ")} expecting an array.
+
+\textbf{Fix applied:} Added a \texttt{topicList()} helper that handles both string and array forms. Rebuilt and redeployed.
+
+\textbf{Re-test result:} \texttt{StatusCode: 200}, duration 1056\,ms, no errors. Email received in Gmail inbox with subject ``\texttt{AIKnowledgeHub: 3 new papers in NLP}''. HTML body contained paper titles, topics, summaries, and PDF links.
+
+\textbf{Verdict:} \textcolor{green!60!black}{\textbf{PASS}} (after bug fix)
+
+\subsection{Test Summary}
+
+\begin{tabularx}{\textwidth}{lccX}
+\toprule
+\textbf{Stage} & \textbf{Lambda} & \textbf{Result} & \textbf{Notes} \\
+\midrule
+Scraper          & scraper-processor       & PASS & 27 papers ingested from arXiv \\
+AI Processor     & ai-processor            & PASS & Tested with local Ollama (Bedrock quota blocked) \\
+Subscription     & subscription-processor  & PASS & Fan-out to SQS confirmed \\
+Email Sender     & email-sender            & PASS & Bug fixed, email delivered via SES \\
+\bottomrule
+\end{tabularx}
+
+\section{Teammate Setup Guide: Testing the \texttt{aws-terraform-setup} Branch}
+
+This section provides a complete step-by-step guide for a teammate who wants to clone the branch and test the full infrastructure from scratch.
+
+\subsection{Prerequisites}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{AWS CLI v2} installed and configured with credentials that have admin-level permissions:
+    \begin{lstlisting}[basicstyle=\ttfamily\small]
+aws configure
+# Enter: Access Key ID, Secret Access Key, region: eu-west-1, output: json
+    \end{lstlisting}
+  \item \textbf{Terraform} $\geq$ 1.5 installed: \url{https://developer.hashicorp.com/terraform/install}
+  \item \textbf{Node.js} $\geq$ 18.x (for \texttt{npm install} during Lambda packaging)
+  \item \textbf{Git Bash} (on Windows) or a Unix shell (macOS/Linux)
+  \item \textbf{zip} utility. On Git Bash: \texttt{pacman -S zip} or verify \texttt{which zip} returns a path. Without it, builds fall back to PowerShell \texttt{Compress-Archive} (much slower).
+\end{enumerate}
+
+\subsection{Step 1: Clone and switch to the branch}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+git clone https://github.com/JadR05/AIKnowledgeHub.git
+cd AIKnowledgeHub/infra
+git checkout aws-terraform-setup
+\end{lstlisting}
+
+\subsection{Step 2: Configure Terraform variables}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+cp terraform.tfvars.example terraform.tfvars
+\end{lstlisting}
+
+Edit \texttt{terraform.tfvars} and set:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{ses\_sender\_email} --- an email address you own (you will verify it in Step~4)
+  \item \texttt{aws\_region} --- keep \texttt{"eu-west-1"} or change to your preferred region
+  \item \texttt{bedrock\_model\_id} --- keep the default or change (see \S{}\ref{sec:swapping-models} below)
+\end{itemize}
+
+\subsection{Step 3: Verify SES sender identity}
+
+\begin{enumerate}[leftmargin=*]
+  \item Go to the \textbf{AWS Console} $\to$ \textbf{SES} $\to$ \textbf{Verified Identities}
+  \item Click \textbf{Create Identity} $\to$ choose \textbf{Email address}
+  \item Enter the same email from \texttt{ses\_sender\_email}
+  \item Open your inbox and click the verification link from AWS
+\end{enumerate}
+
+Note: SES starts in \emph{sandbox mode}. Both sender and recipient must be verified. Since the test emails go from your address to itself, verifying one address is sufficient.
+
+\subsection{Step 4: Enable Bedrock model access}
+
+\begin{enumerate}[leftmargin=*]
+  \item AWS Console $\to$ \textbf{Amazon Bedrock} $\to$ \textbf{Model access}
+  \item Request access to \textbf{Anthropic Claude 3 Haiku} (or whichever model you configured)
+  \item Fill in the use-case form when prompted (approval is usually instant for Haiku)
+  \item New accounts may have low daily token quotas --- request an increase via \textbf{Service Quotas} if needed
+\end{enumerate}
+
+\subsection{Step 5: Build Lambda packages}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+chmod +x build.sh
+./build.sh
+\end{lstlisting}
+
+This creates four zip files in \texttt{builds/}:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{scraper-processor.zip}
+  \item \texttt{ai-processor.zip}
+  \item \texttt{subscription-processor.zip}
+  \item \texttt{email-sender.zip}
+\end{itemize}
+
+\subsection{Step 6: Deploy infrastructure}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+terraform init
+terraform plan        # review what will be created
+terraform apply       # type "yes" to confirm
+\end{lstlisting}
+
+This provisions ${\approx}$44 AWS resources (VPC, subnets, NAT, endpoints, DynamoDB tables, SQS queues, Lambdas, IAM roles, S3 bucket, EventBridge schedules, CloudWatch log groups).
+
+Terraform outputs the key resource names/URLs at the end. Note the \texttt{paper\_queue\_url} and \texttt{email\_queue\_url} for manual testing.
+
+\subsection{Step 7: Test the scraper}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws lambda invoke --function-name aikhub-scraper-processor \
+  --region eu-west-1 --payload '{}' \
+  --cli-binary-format raw-in-base64-out /tmp/scraper.json
+cat /tmp/scraper.json
+\end{lstlisting}
+
+Verify papers landed in DynamoDB:
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws dynamodb scan --table-name aikhub-papers \
+  --region eu-west-1 --select COUNT
+\end{lstlisting}
+
+Expected: 20--30 papers.
+
+\subsection{Step 8: Test AI processing}
+
+The scraper automatically sends an SQS message that triggers \texttt{ai-processor}. Wait 1--2 minutes, then check:
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws dynamodb scan --table-name aikhub-papers \
+  --region eu-west-1 \
+  --filter-expression "attribute_exists(audioUrl)" \
+  --select COUNT
+\end{lstlisting}
+
+If the count is 0 after several minutes, check logs:
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+MSYS_NO_PATHCONV=1 aws logs tail \
+  /aws/lambda/aikhub-ai-processor --region eu-west-1 --since 10m
+\end{lstlisting}
+
+Common issue: Bedrock quota exhausted on new accounts. Wait for UTC midnight reset or request a quota increase.
+
+\subsection{Step 9: Test subscription + email delivery}
+
+Seed a test subscriber:
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws dynamodb put-item --table-name aikhub-subscriptions \
+  --region eu-west-1 \
+  --item '{"email":{"S":"YOUR_VERIFIED_EMAIL"},
+           "subscribedTopics":{"L":[{"S":"NLP"}]}}'
+\end{lstlisting}
+
+Trigger the subscription processor:
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws lambda invoke \
+  --function-name aikhub-subscription-processor \
+  --region eu-west-1 --payload '{}' \
+  --cli-binary-format raw-in-base64-out /tmp/sub.json
+\end{lstlisting}
+
+Check email-sender logs:
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+MSYS_NO_PATHCONV=1 aws logs tail \
+  /aws/lambda/aikhub-email-sender --region eu-west-1 --since 5m
+\end{lstlisting}
+
+Check your inbox (and spam folder) for the digest email.
+
+\subsection{Step 10: Verify S3 audio files}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws s3 ls s3://aikhub-audio-summaries/audio/ --region eu-west-1
+\end{lstlisting}
+
+To listen to a file (generates a temporary URL valid for 1 hour):
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws s3 presign s3://aikhub-audio-summaries/audio/<PAPER_ID>.mp3 \
+  --region eu-west-1 --expires-in 3600
+\end{lstlisting}
+
+\subsection{Step 11: Tear down (when done testing)}
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+terraform destroy    # type "yes" to confirm
+\end{lstlisting}
+
+\textbf{Important:} The NAT Gateway costs ${\approx}$\$1.08/day even when idle. Always destroy the stack when you are not actively testing, unless you intend to keep it running.
+
+Note: Security group destruction can take 20--45 minutes due to Lambda Hyperplane ENI release delays. This is normal --- do not cancel the destroy.
+
+\subsection{Swapping Bedrock Models}
+\label{sec:swapping-models}
+
+The Converse API is model-agnostic. Change the model in \texttt{terraform.tfvars}:
 \begin{lstlisting}[language=hcl]
 # Anthropic Claude 3 Haiku (default)
 bedrock_model_id = "eu.anthropic.claude-3-haiku-20240307-v1:0"
 # Amazon Nova Micro (cheapest)
 bedrock_model_id = "eu.amazon.nova-micro-v1:0"
 \end{lstlisting}
-Run \texttt{terraform apply}; no code rebuild, no Lambda replacement.
+Run \texttt{terraform apply} --- no rebuild needed, just an environment variable update.
+
+\subsection{Troubleshooting}
+
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Symptom} & \textbf{Fix} \\
+\midrule
+\texttt{TimeoutError ETIMEDOUT} on Lambda & VPC endpoint or security group misconfigured. Verify SG has self-referencing ingress on port 443. \\
+\texttt{ThrottlingException} from Bedrock & Daily token quota exhausted. Wait for UTC midnight reset or request increase via Service Quotas. \\
+\texttt{ResourceNotFoundException} from Bedrock & Model access not granted. Complete the use-case form in Bedrock console. \\
+\texttt{MessageRejected} from SES & Recipient not verified (sandbox mode). Verify the recipient email or request production access. \\
+Build hangs on \texttt{Compress-Archive} & Install native \texttt{zip}: \texttt{pacman -S zip} in Git Bash. \\
+\texttt{/aws/lambda/...} path mangled on Git Bash & Prefix command with \texttt{MSYS\_NO\_PATHCONV=1}. \\
+SG destroy takes 20+ minutes & Normal. Lambda Hyperplane ENIs take 20--45 min to release. Do not cancel. \\
+\bottomrule
+\end{tabularx}
 
 \section{Known Limitations and Future Work}
 
