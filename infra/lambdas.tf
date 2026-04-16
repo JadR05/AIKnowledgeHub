@@ -2,7 +2,7 @@
 
 resource "aws_lambda_function" "scraper_processor" {
   function_name = "${var.project_name}-scraper-processor"
-  runtime       = "nodejs18.x"
+  runtime       = "nodejs20.x"
   handler       = "index.handler"
   role          = aws_iam_role.lambda_exec.arn
 
@@ -14,22 +14,24 @@ resource "aws_lambda_function" "scraper_processor" {
 
   environment {
     variables = {
-      MONGODB_URI     = var.mongodb_uri
+      PAPERS_TABLE    = aws_dynamodb_table.papers.name
       PAPER_QUEUE_URL = aws_sqs_queue.paper_queue.id
     }
   }
 
   vpc_config {
-    subnet_ids         = var.private_subnet_ids
-    security_group_ids = [var.lambda_security_group_id]
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
   }
+
+  depends_on = [aws_cloudwatch_log_group.scraper_processor]
 }
 
 # ─── Subscription Processor Lambda ───
 
 resource "aws_lambda_function" "subscription_processor" {
   function_name = "${var.project_name}-subscription-processor"
-  runtime       = "nodejs18.x"
+  runtime       = "nodejs20.x"
   handler       = "index.handler"
   role          = aws_iam_role.lambda_exec.arn
 
@@ -41,22 +43,25 @@ resource "aws_lambda_function" "subscription_processor" {
 
   environment {
     variables = {
-      MONGODB_URI     = var.mongodb_uri
-      EMAIL_QUEUE_URL = aws_sqs_queue.email_queue.id
+      PAPERS_TABLE        = aws_dynamodb_table.papers.name
+      SUBSCRIPTIONS_TABLE = aws_dynamodb_table.subscriptions.name
+      EMAIL_QUEUE_URL     = aws_sqs_queue.email_queue.id
     }
   }
 
   vpc_config {
-    subnet_ids         = var.private_subnet_ids
-    security_group_ids = [var.lambda_security_group_id]
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
   }
+
+  depends_on = [aws_cloudwatch_log_group.subscription_processor]
 }
 
 # ─── Email Sender Lambda ───
 
 resource "aws_lambda_function" "email_sender" {
   function_name = "${var.project_name}-email-sender"
-  runtime       = "nodejs18.x"
+  runtime       = "nodejs20.x"
   handler       = "index.handler"
   role          = aws_iam_role.lambda_exec.arn
 
@@ -71,13 +76,15 @@ resource "aws_lambda_function" "email_sender" {
       SES_SENDER_EMAIL = var.ses_sender_email
     }
   }
+
+  depends_on = [aws_cloudwatch_log_group.email_sender]
 }
 
 # ─── AI Processor Lambda ───
 
 resource "aws_lambda_function" "ai_processor" {
   function_name = "${var.project_name}-ai-processor"
-  runtime       = "nodejs18.x"
+  runtime       = "nodejs20.x"
   handler       = "index.handler"
   role          = aws_iam_role.lambda_exec.arn
 
@@ -89,16 +96,18 @@ resource "aws_lambda_function" "ai_processor" {
 
   environment {
     variables = {
-      MONGODB_URI      = var.mongodb_uri
+      PAPERS_TABLE     = aws_dynamodb_table.papers.name
       S3_BUCKET        = aws_s3_bucket.audio_bucket.id
       BEDROCK_MODEL_ID = var.bedrock_model_id
     }
   }
 
   vpc_config {
-    subnet_ids         = var.private_subnet_ids
-    security_group_ids = [var.lambda_security_group_id]
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
   }
+
+  depends_on = [aws_cloudwatch_log_group.ai_processor]
 }
 
 # ─── SQS Triggers ───

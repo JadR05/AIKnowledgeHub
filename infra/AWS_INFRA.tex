@@ -1,0 +1,552 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+
+\definecolor{codebg}{RGB}{245,245,247}
+\definecolor{codekw}{RGB}{20,90,160}
+\definecolor{codestr}{RGB}{30,120,60}
+\definecolor{codecom}{RGB}{120,120,120}
+
+\lstdefinelanguage{hcl}{
+  keywords={resource, variable, output, module, provider, data, locals, terraform, required_providers, required_version, true, false, null, for_each, count, depends_on},
+  keywordstyle=\color{codekw}\bfseries,
+  sensitive=true,
+  morecomment=[l]{\#},
+  morestring=[b]",
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0pt,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  commentstyle=\color{codecom}\itshape,
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  xleftmargin=8pt,
+  xrightmargin=8pt,
+  aboveskip=8pt,
+  belowskip=8pt,
+}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.6em}{}
+
+\title{\textbf{AIKnowledgeHub}\\[4pt]\large AWS Serverless Infrastructure Reference}
+\author{AIKnowledgeHub Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+AIKnowledgeHub is a serverless pipeline that scrapes fresh AI research papers from arXiv, generates plain-language summaries with Amazon Bedrock, converts those summaries to audio with Amazon Polly, stores results in DynamoDB and S3, and delivers personalised email digests to subscribers through Amazon SES. The entire back-end is defined in Terraform and runs as four AWS Lambda functions coordinated by Amazon SQS queues and Amazon EventBridge schedules. This document is a complete reference for the infrastructure: what each resource does, why it exists, how the Lambdas interact with it, and how to deploy, operate, and tear it down.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+\hrule
+
+\section{Project Overview}
+
+\subsection{End goal}
+Deliver a personalised daily digest of new AI research papers to subscribers. Each paper includes a machine-generated summary (3--4 sentences, in plain English) and a short audio version of that summary so users can read or listen to keep up with the field passively.
+
+\subsection{Repository layout}
+The Git repository contains three top-level directories:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{backend/} --- the original Express REST API. It still serves the front-end (\texttt{/papers}, \texttt{/subscriptions}, etc.) using MongoDB. It is unchanged by this work.
+  \item \texttt{frontend/} --- the React/Vite single-page application.
+  \item \texttt{infra/} --- the serverless back-end: Terraform code for all AWS resources, plus the four Lambda function sources. \textit{This document describes the contents of this folder.}
+\end{itemize}
+
+\subsection{Why serverless}
+The original monolithic Express backend mixes three unrelated concerns: scraping, AI summarisation, and email. Each has very different scaling and reliability characteristics. Breaking them into four Lambdas connected by queues:
+\begin{itemize}[leftmargin=*]
+  \item lets each function scale independently,
+  \item isolates failure (a Bedrock outage cannot stall the scraper),
+  \item removes the need for always-on compute,
+  \item makes retries, dead-letter queues, and backoff free.
+\end{itemize}
+
+\section{Top-Level Architecture}
+
+\subsection{Component diagram}
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+         +----------------------+
+         |     EventBridge      |
+         |   (cron schedules)   |
+         +----------+-----------+
+                    |
+        +-----------+------------+
+        |                        |
+        v                        v
++-------------------+   +----------------------------+
+| scraper-processor |   |   subscription-processor   |
+|    (Lambda)       |   |         (Lambda)           |
++---------+---------+   +-------------+--------------+
+          |                           |
+     DynamoDB                    SQS email_queue
+          |                           |
+          v                           v
+     SQS paper_queue         +---------------------+
+          |                   |    email-sender     |
+          v                   |  (Lambda + SES)     |
++-------------------+         +---------------------+
+|   ai-processor    |
+|    (Lambda)       |
++--+-----+-----+----+
+   v     v     v
+ Bedrock Polly  S3 (audio MP3s)
+                    |
+                    v
+              DynamoDB (audioUrl, aiSummary)
+\end{lstlisting}
+
+\subsection{Data flow in prose}
+\begin{enumerate}[leftmargin=*]
+  \item EventBridge fires daily at 02:00 UTC $\rightarrow$ invokes \texttt{scraper-processor}.
+  \item \texttt{scraper-processor} fetches the latest papers from arXiv for three categories (NLP, Computer Vision, Reinforcement Learning), writes each new paper to the \texttt{aikhub-papers} DynamoDB table using a conditional put (silent deduplication on \texttt{externalId}), and pushes one SQS message per topic summarising how many new papers were inserted.
+  \item SQS's event-source mapping automatically invokes \texttt{ai-processor} with those messages (batches of up to five).
+  \item \texttt{ai-processor} queries DynamoDB for papers in that topic that do not yet have an \texttt{audioUrl}, calls Bedrock to summarise each one, calls Polly to turn the summary into an MP3, uploads the MP3 to S3, and updates the DynamoDB item with both the summary and the audio URL.
+  \item EventBridge fires daily at 08:00 UTC $\rightarrow$ invokes \texttt{subscription-processor}.
+  \item \texttt{subscription-processor} scans the \texttt{aikhub-subscriptions} table, queries \texttt{aikhub-papers} by topic using the \texttt{topic-createdAt-index} GSI for each user's interests (filtered by \texttt{createdAt > lastEmailSent}), and publishes a shrunken payload of up to 20 papers to the \texttt{email\_queue}.
+  \item SQS's event-source mapping invokes \texttt{email-sender}, which renders a plain-text + HTML digest and delivers it via SES.
+\end{enumerate}
+
+\section{AWS Services Used}
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{Service} & \textbf{Role in AIKnowledgeHub} \\
+\midrule
+AWS Lambda          & Hosts the four back-end functions. \\
+Amazon SQS          & Queues decouple the Lambdas; DLQs hold poison messages. \\
+Amazon EventBridge  & Cron schedules for the scraper and subscription processors. \\
+Amazon DynamoDB     & Persistent store for papers and subscriptions. \\
+Amazon S3           & Stores generated MP3 audio summaries. \\
+Amazon Bedrock      & LLM (Anthropic Claude 3 Haiku) for text summarisation. \\
+Amazon Polly        & Neural TTS engine for generating MP3s. \\
+Amazon SES          & Sends the digest emails. \\
+Amazon VPC          & Network isolation for the Lambdas. \\
+NAT Gateway         & Outbound internet access from private subnets (for arXiv). \\
+VPC Endpoints       & Private paths from Lambdas to SQS, SES, and DynamoDB. \\
+AWS IAM             & Single execution role granting least-privilege access. \\
+Amazon CloudWatch   & Central log aggregation for every Lambda. \\
+\bottomrule
+\end{tabularx}
+\caption{AWS services composing the infrastructure.}
+\end{table}
+
+\section{Terraform Layout}
+
+The \texttt{infra/} folder contains one Terraform file per concern. All files are in the same module; there are no nested modules. All resources are tagged with \texttt{var.tags}.
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{File} & \textbf{What it declares} \\
+\midrule
+\texttt{providers.tf}    & Terraform $\geq$ 1.5 and AWS provider $\sim$5.0 pinned; region from variable. \\
+\texttt{variables.tf}    & Inputs: \texttt{aws\_region}, \texttt{project\_name}, \texttt{ses\_sender\_email}, \texttt{bedrock\_model\_id}, \texttt{tags}. \\
+\texttt{vpc.tf}          & VPC, subnets, IGW, NAT, route tables, lambda SG. \\
+\texttt{networking.tf}   & VPC interface endpoints for SQS and SES, Gateway endpoint for DynamoDB. \\
+\texttt{sqs.tf}          & Two main queues and two dead-letter queues. \\
+\texttt{s3.tf}           & Audio bucket with encryption, versioning, lifecycle rules. \\
+\texttt{dynamodb.tf}     & \texttt{aikhub-papers} (with GSI) and \texttt{aikhub-subscriptions}. \\
+\texttt{iam.tf}          & Single Lambda execution role plus inline policy. \\
+\texttt{lambdas.tf}      & Four Lambda functions + SQS event-source mappings. \\
+\texttt{eventbridge.tf}  & Two cron rules, two targets, two invoke permissions. \\
+\texttt{monitoring.tf}   & Pre-created CloudWatch log groups. \\
+\texttt{outputs.tf}      & Lambda names, queue URLs, table names, bucket name, NAT EIP. \\
+\texttt{terraform.tfvars.example} & Template for secret/variable values. \\
+\texttt{build.sh}        & Packages Lambda source into zips before \texttt{terraform apply}. \\
+\texttt{lambda/}         & Source for all four Lambdas plus shared code. \\
+\bottomrule
+\end{tabularx}
+\caption{Contents of the \texttt{infra/} directory.}
+\end{table}
+
+\section{Networking}
+
+\subsection{VPC topology}
+\texttt{vpc.tf} creates a fresh VPC with CIDR \texttt{10.0.0.0/16}. Two public subnets (\texttt{10.0.1.0/24}, \texttt{10.0.2.0/24}) host the NAT Gateway; two private subnets (\texttt{10.0.11.0/24}, \texttt{10.0.12.0/24}) host the VPC-attached Lambda ENIs. The subnets are spread across the first two availability zones in the chosen region.
+
+\subsection{Routing}
+The public route table routes \texttt{0.0.0.0/0} through the Internet Gateway. The private route table routes \texttt{0.0.0.0/0} through the NAT Gateway, giving Lambdas outbound internet access without making them reachable from outside.
+
+\subsection{VPC endpoints}
+Three VPC endpoints bypass the internet for common AWS calls:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{SQS} --- Interface endpoint in both private subnets. Lambdas call SQS by private IP.
+  \item \textbf{SES} --- Interface endpoint (\texttt{com.amazonaws.<region>.email}) for SES API calls.
+  \item \textbf{DynamoDB} --- Gateway endpoint attached to the private route table. Free, and avoids paying for NAT bandwidth on DynamoDB traffic.
+\end{itemize}
+
+Interface endpoints create ENIs in the private subnets. These ENIs use the Lambda security group, which has a self-referencing inbound 443 rule so Lambdas can actually connect to them. (Without that rule, endpoint ENIs silently drop inbound packets.)
+
+\subsection{Security group}
+A single \texttt{aws\_security\_group.lambda} covers both Lambda ENIs and endpoint ENIs:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Egress:} all traffic allowed (needed for arXiv, Bedrock, Polly, SES, etc.).
+  \item \textbf{Ingress:} 443/TCP from itself --- lets Lambdas reach interface endpoints.
+\end{itemize}
+
+\section{Data Model (DynamoDB)}
+
+\subsection{\texttt{aikhub-papers}}
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{Attribute} & \textbf{Meaning} \\
+\midrule
+\texttt{externalId} (PK, String) & arXiv paper identifier (e.g.\ \texttt{2401.12345v1}). \\
+\texttt{title} (String)          & Paper title. \\
+\texttt{topic} (String)          & Single primary topic: NLP, Computer Vision, or Reinforcement Learning. Used as GSI partition key. \\
+\texttt{topics} (List)           & Original topic array, kept for display. \\
+\texttt{summary} (String)        & Abstract from arXiv (raw). \\
+\texttt{aiSummary} (String)      & LLM-generated 3--4 sentence summary (set by \texttt{ai-processor}). \\
+\texttt{audioUrl} (String)       & S3 URL of the Polly-generated MP3 (set by \texttt{ai-processor}). \\
+\texttt{pdfUrl} (String)         & Direct link to the paper's PDF on arXiv. \\
+\texttt{source} (String)         & \texttt{"arXiv"}. \\
+\texttt{publishedAt} (String)    & ISO-8601 original publish date. \\
+\texttt{createdAt} (String)      & ISO-8601 insertion time. GSI sort key. \\
+\texttt{views} (Number)          & View count (updated by the front-end path; 0 at insertion). \\
+\bottomrule
+\end{tabularx}
+\caption{Attributes of the \texttt{aikhub-papers} table.}
+\end{table}
+
+\paragraph{Global secondary index.} \texttt{topic-createdAt-index} has partition key \texttt{topic} and sort key \texttt{createdAt}, projecting all attributes. This supports the two hot queries:
+\begin{enumerate}[leftmargin=*]
+  \item \texttt{ai-processor} reads unprocessed papers for a topic.
+  \item \texttt{subscription-processor} reads papers for a topic newer than a user's \texttt{lastEmailSent}.
+\end{enumerate}
+
+\paragraph{Billing.} Both tables use \texttt{PAY\_PER\_REQUEST}: no capacity planning, costs scale with traffic, ideal for bursty / low-volume use.
+
+\subsection{\texttt{aikhub-subscriptions}}
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{Attribute} & \textbf{Meaning} \\
+\midrule
+\texttt{email} (PK, String)   & Subscriber email address. \\
+\texttt{subscribedTopics} (List) & Array of topic names the user is interested in. \\
+\texttt{lastEmailSent} (String) & ISO-8601 of the most recent digest delivery. Used to avoid re-sending. \\
+\bottomrule
+\end{tabularx}
+\caption{Attributes of the \texttt{aikhub-subscriptions} table.}
+\end{table}
+
+\section{Queue Topology (SQS)}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\texttt{aikhub-paper-processing}} --- receives scraper fan-out messages; consumed by \texttt{ai-processor}. Visibility timeout 300\,s (matches the Lambda's max runtime).
+  \item \textbf{\texttt{aikhub-email-queue}} --- receives one message per subscriber-digest; consumed by \texttt{email-sender}. Visibility timeout 60\,s.
+  \item Each has a matching \textbf{dead-letter queue} (\texttt{*-dlq}) with 14-day retention and a redrive policy of \texttt{maxReceiveCount = 3}.
+\end{itemize}
+
+Both main queues are wired to their consumer via \texttt{aws\_lambda\_event\_source\_mapping} with a \texttt{batch\_size} of 5. Failed items can be reported back through the standard \texttt{batchItemFailures} response; this is used by \texttt{email-sender} so that a failure for one recipient does not reprocess the entire batch.
+
+\section{Scheduling (EventBridge)}
+
+Two \texttt{aws\_cloudwatch\_event\_rule} resources:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Name} & \textbf{Cron} & \textbf{Target} \\
+\midrule
+\texttt{aikhub-daily-scrape} & \texttt{cron(0 2 * * ? *)} & \texttt{scraper-processor} \\
+\texttt{aikhub-daily-email}  & \texttt{cron(0 8 * * ? *)} & \texttt{subscription-processor} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each rule has a corresponding \texttt{aws\_lambda\_permission} granting \texttt{events.amazonaws.com} invoke rights for just that rule's ARN.
+
+\section{IAM}
+
+A single execution role \texttt{aikhub-lambda-exec} is assumed by all four Lambdas. Its inline policy grants only the actions each Lambda actually uses:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{logs:CreateLogGroup, CreateLogStream, PutLogEvents} --- CloudWatch Logs.
+  \item \texttt{sqs:SendMessage, ReceiveMessage, DeleteMessage, GetQueueAttributes} --- queue I/O.
+  \item \texttt{ses:SendEmail, SendRawEmail} --- email delivery.
+  \item \texttt{bedrock:InvokeModel} --- LLM summarisation.
+  \item \texttt{polly:SynthesizeSpeech} --- text-to-speech.
+  \item \texttt{s3:PutObject, GetObject} --- scoped to \texttt{\$\{audio\_bucket.arn\}/*}.
+  \item \texttt{ec2:CreateNetworkInterface, DescribeNetworkInterfaces, DeleteNetworkInterface} --- required for VPC-attached Lambdas.
+  \item \texttt{dynamodb:PutItem, GetItem, UpdateItem, DeleteItem, Query, Scan, BatchGetItem, BatchWriteItem} --- scoped to both tables' ARNs and \texttt{papers/index/*} for GSI access.
+\end{itemize}
+
+Bedrock and Polly actions are intentionally scoped to \texttt{"*"} because service-level ARNs are clumsy and these APIs do not support fine-grained resource policies usefully. The other high-risk actions (S3, DynamoDB) are ARN-scoped.
+
+\section{Storage (S3)}
+
+The \texttt{aikhub-audio-summaries} bucket holds all Polly-generated MP3s. Hardened with:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Public access block:} all four flags on.
+  \item \textbf{Server-side encryption:} AES-256 default.
+  \item \textbf{Versioning:} enabled.
+  \item \textbf{Lifecycle rule:} non-current versions expire after 30 days; stalled multipart uploads abort after 7.
+\end{itemize}
+
+Object keys use the sanitised paper ID: \texttt{audio/\{externalId\}.mp3}. Because the bucket is private, any front-end that wants to play these files needs either a pre-signed URL or a CloudFront distribution with an Origin Access Control. Wiring that up is out of scope for the current infrastructure.
+
+\section{Lambda Functions}
+
+\subsection{\texttt{scraper-processor}}
+
+\textbf{Trigger:} EventBridge cron (daily at 02:00 UTC) or manual \texttt{aws lambda invoke}. \\
+\textbf{Runtime:} Node.js 20, 256\,MB, 120\,s timeout, VPC-attached. \\
+\textbf{Environment:} \texttt{PAPERS\_TABLE}, \texttt{PAPER\_QUEUE\_URL}. \\
+\textbf{Code:} \texttt{lambda/scraper-processor/index.js} and \texttt{services/scraper.service.js}.
+
+\paragraph{What it does.}
+\begin{enumerate}[leftmargin=*]
+  \item For each of three arXiv categories (\texttt{cs.CL}, \texttt{cs.CV}, \texttt{cs.LG}), fetches up to 10 newest papers via the public arXiv API.
+  \item Parses the Atom XML response with \texttt{fast-xml-parser} and extracts title, summary, PDF link, and external ID.
+  \item Calls \texttt{PutCommand} on DynamoDB with \texttt{ConditionExpression: "attribute\_not\_exists(externalId)"}. Duplicates throw \texttt{ConditionalCheckFailedException} which is caught and counted as \texttt{skipped} --- no errors, no cost for rewriting existing rows.
+  \item For every category that inserted at least one new paper, pushes a JSON message to \texttt{paper\_queue}: \texttt{\{ action, topic, category, insertedCount \}}. The downstream consumer uses \texttt{topic} to know which papers to process.
+\end{enumerate}
+
+\subsection{\texttt{ai-processor}}
+
+\textbf{Trigger:} SQS event-source mapping on \texttt{paper\_queue}, batch size 5. \\
+\textbf{Runtime:} Node.js 20, 512\,MB, 300\,s timeout, VPC-attached. \\
+\textbf{Environment:} \texttt{PAPERS\_TABLE}, \texttt{S3\_BUCKET}, \texttt{BEDROCK\_MODEL\_ID}.
+
+\paragraph{What it does.} For each SQS record:
+\begin{enumerate}[leftmargin=*]
+  \item Queries \texttt{topic-createdAt-index} for the named topic, with \texttt{FilterExpression: "attribute\_not\_exists(audioUrl)"}. Only papers that still need processing come back. A small \texttt{Limit} multiplier compensates for the filter happening post-query.
+  \item For each returned paper (double-check \texttt{audioUrl} absent for idempotency on SQS retry):
+    \begin{itemize}[leftmargin=*]
+      \item \textbf{Bedrock.} Calls \texttt{ConverseCommand} with the configured inference profile (default \texttt{eu.anthropic.claude-3-haiku-20240307-v1:0}). Converse normalises request format across Anthropic, Amazon Nova, Llama, etc., so the model can be swapped in \texttt{terraform.tfvars} without code changes.
+      \item \textbf{Polly.} \texttt{SynthesizeSpeech} with neural voice \texttt{Joanna}, MP3 output.
+      \item \textbf{S3.} \texttt{PutObject} under \texttt{audio/\{sanitizedId\}.mp3}.
+      \item \textbf{DynamoDB.} \texttt{UpdateItem} on the paper, setting \texttt{aiSummary} and \texttt{audioUrl}.
+    \end{itemize}
+\end{enumerate}
+
+If any step throws, the whole batch item fails and SQS re-delivers it up to three times before routing to \texttt{paper\_dlq}. Because the \texttt{audioUrl} check is re-tested per paper, a retry after a partial batch will not re-summarise or re-upload already-done papers.
+
+\subsection{\texttt{subscription-processor}}
+
+\textbf{Trigger:} EventBridge cron (daily at 08:00 UTC). \\
+\textbf{Runtime:} Node.js 20, 256\,MB, 120\,s timeout, VPC-attached. \\
+\textbf{Environment:} \texttt{PAPERS\_TABLE}, \texttt{SUBSCRIPTIONS\_TABLE}, \texttt{EMAIL\_QUEUE\_URL}.
+
+\paragraph{What it does.}
+\begin{enumerate}[leftmargin=*]
+  \item \texttt{Scan}s the \texttt{aikhub-subscriptions} table. Scan is acceptable here because the subscriber table is small and only iterated once per day.
+  \item For every user, queries \texttt{topic-createdAt-index} in parallel for each of their \texttt{subscribedTopics}. The key condition is \texttt{topic = :t AND createdAt > :lastEmailSent} when the user already received an email, otherwise \texttt{topic = :t}.
+  \item If the user has no new papers, falls back to the top-5 most-viewed papers in their topics so they always get something.
+  \item Trims the result to 20 papers and 500-character summaries to stay safely under the SQS message size limit of 256\,KB. Each slimmed paper item carries only \texttt{externalId}, \texttt{title}, \texttt{topic}, \texttt{summary} (preferring \texttt{aiSummary}), \texttt{pdfUrl}.
+  \item Sends the payload to \texttt{email\_queue}.
+  \item \texttt{UpdateItem}s the user's \texttt{lastEmailSent} to the current ISO timestamp.
+\end{enumerate}
+
+\subsection{\texttt{email-sender}}
+
+\textbf{Trigger:} SQS event-source mapping on \texttt{email\_queue}, batch size 5. \\
+\textbf{Runtime:} Node.js 20, 128\,MB, 30\,s timeout, \emph{not} VPC-attached (SES public endpoint is fine; avoids ENI overhead). \\
+\textbf{Environment:} \texttt{SES\_SENDER\_EMAIL}.
+
+\paragraph{What it does.}
+\begin{enumerate}[leftmargin=*]
+  \item Renders a plain-text and HTML body from the slimmed paper list.
+  \item Calls \texttt{SESClient.SendEmail}.
+  \item Per record, appends \texttt{\{ messageId, status \}} to a results buffer.
+  \item Returns a \texttt{batchItemFailures} array so that partial batch failures only retry the failed items, not the whole batch.
+\end{enumerate}
+
+\subsection{Shared code}
+\texttt{lambda/shared/dynamo.js} exports a pre-configured DynamoDB Document Client:
+\begin{lstlisting}[language=java]
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+
+const baseClient = new DynamoDBClient({});
+export const ddb = DynamoDBDocumentClient.from(baseClient, {
+  marshallOptions: {
+    removeUndefinedValues: true,
+    convertEmptyValues: false,
+  },
+});
+\end{lstlisting}
+No caching is needed --- the DynamoDB client is stateless, unlike the previous Mongoose connection. This file is copied into every Lambda that needs it by \texttt{build.sh}.
+
+\section{Packaging: \texttt{build.sh}}
+
+Terraform uploads a Lambda as a zip. \texttt{build.sh} produces the zips each deploy. For every Lambda:
+
+\begin{enumerate}[leftmargin=*]
+  \item Wipes and recreates \texttt{infra/builds/}.
+  \item Copies the Lambda source into a staging directory.
+  \item If the Lambda imports from \texttt{./shared}, copies \texttt{lambda/shared/} into the staging folder.
+  \item Runs \texttt{npm install --omit=dev --no-audit --no-fund --silent} in the staging folder to pull in production dependencies into \texttt{node\_modules/}.
+  \item Zips the staging contents into \texttt{builds/<lambda-name>.zip}. On Linux/macOS this uses \texttt{zip}; on Git Bash (Windows) it falls back to PowerShell's \texttt{Compress-Archive}, with paths converted through \texttt{cygpath -w}.
+  \item Deletes the staging folder.
+\end{enumerate}
+
+Terraform detects source changes via \texttt{source\_code\_hash = filebase64sha256(...)}. The next \texttt{terraform apply} automatically uploads changed zips.
+
+\section{Deployment Workflow}
+
+\subsection{Prerequisites}
+\begin{itemize}[leftmargin=*]
+  \item Terraform $\geq$ 1.5, Node.js $\geq$ 18, AWS CLI v2.
+  \item AWS credentials configured locally (\texttt{aws configure}; \emph{never} pasted into repo files).
+  \item SES sender identity verified in the target region.
+  \item Bedrock model access: for Anthropic Claude models, the use-case form must be submitted once per account via the Bedrock console.
+\end{itemize}
+
+\subsection{Config}
+Copy \texttt{terraform.tfvars.example} to \texttt{terraform.tfvars} and fill:
+\begin{lstlisting}[language=hcl]
+aws_region       = "eu-west-1"
+project_name     = "aikhub"
+ses_sender_email = "you@yourdomain.com"
+bedrock_model_id = "eu.anthropic.claude-3-haiku-20240307-v1:0"
+\end{lstlisting}
+
+\texttt{terraform.tfvars} is \texttt{.gitignore}d. The \texttt{.example} file is tracked and must contain only placeholder values.
+
+\subsection{Apply}
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+cd infra
+./build.sh
+terraform init
+terraform apply
+\end{lstlisting}
+
+The first apply provisions ${\sim}45$ resources in 3--5 minutes. The NAT Gateway is the slowest; VPC endpoints take ${\sim}60$ seconds each.
+
+\subsection{Teardown}
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+terraform destroy
+\end{lstlisting}
+
+The NAT Gateway bills hourly, so teardown matters. \emph{Warning:} VPC-attached Lambdas produce Hyperplane ENIs that can take 20--45 minutes to release, blocking security-group destruction. Plan teardowns with that in mind.
+
+\section{Observability}
+
+Each Lambda has a pre-created \texttt{aws\_cloudwatch\_log\_group} at \texttt{/aws/lambda/aikhub-<name>} with 14-day retention. Terraform owning the log group (rather than letting Lambda auto-create it on first invocation) enforces retention and avoids the classic drift where the log group exists but is untracked.
+
+Live tailing (Git Bash on Windows needs the \texttt{MSYS\_NO\_PATHCONV} escape to prevent path mangling):
+
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+MSYS_NO_PATHCONV=1 aws logs tail /aws/lambda/aikhub-ai-processor \
+  --region eu-west-1 --follow
+\end{lstlisting}
+
+\section{Operational Scenarios}
+
+\subsection{Manual invocation / smoke test}
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws lambda invoke --function-name aikhub-scraper-processor \
+  --region eu-west-1 /tmp/out.json
+cat /tmp/out.json
+\end{lstlisting}
+
+\subsection{Triggering the pipeline with a seeded SQS message}
+Useful when the scraper has nothing new to insert (so no natural SQS fan-out):
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws sqs send-message --region eu-west-1 \
+  --queue-url <paper_queue_url> \
+  --message-body '{"action":"process_new_papers","topic":"NLP","insertedCount":2}'
+\end{lstlisting}
+
+\subsection{Inspecting DynamoDB}
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws dynamodb scan --table-name aikhub-papers --region eu-west-1 --select COUNT
+aws dynamodb scan --table-name aikhub-papers --region eu-west-1 \
+  --filter-expression "attribute_exists(audioUrl)" --select COUNT
+\end{lstlisting}
+
+\subsection{Seeding a test subscriber}
+\begin{lstlisting}[basicstyle=\ttfamily\small]
+aws dynamodb put-item --table-name aikhub-subscriptions --region eu-west-1 \
+  --item '{"email":{"S":"you@example.com"},
+           "subscribedTopics":{"L":[{"S":"NLP"}]}}'
+\end{lstlisting}
+
+Remember: SES accounts start in the \emph{sandbox}, where the recipient address must also be verified. Request production access via the SES dashboard to send to arbitrary recipients.
+
+\subsection{Swapping Bedrock models}
+The Converse API makes this a one-line change in \texttt{terraform.tfvars}:
+\begin{lstlisting}[language=hcl]
+# Anthropic Claude 3 Haiku (default)
+bedrock_model_id = "eu.anthropic.claude-3-haiku-20240307-v1:0"
+# Amazon Nova Micro (cheapest)
+bedrock_model_id = "eu.amazon.nova-micro-v1:0"
+\end{lstlisting}
+Run \texttt{terraform apply}; no code rebuild, no Lambda replacement.
+
+\section{Known Limitations and Future Work}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{No public HTTP API in Terraform.} The front-end still talks to the Express back-end for paper reads and subscription writes. An \texttt{aws\_apigatewayv2\_api} + a small read/write Lambda against DynamoDB would close this gap.
+  \item \textbf{S3 audio links are private.} Emails reference \texttt{https://<bucket>.s3.amazonaws.com/audio/...}, which 403s because public access is blocked. Either switch to pre-signed URLs with a sensible TTL or front the bucket with CloudFront + OAC.
+  \item \textbf{No unsubscribe flow.} Production email delivery needs a one-click unsubscribe link and a token scheme, plus double opt-in for new subscriptions.
+  \item \textbf{No CI/CD.} A GitHub Actions workflow could run \texttt{./build.sh} plus \texttt{terraform plan} on pull requests.
+  \item \textbf{No CloudWatch alarms.} Recommended: DLQ depth, Lambda error rate, Bedrock throttle rate.
+  \item \textbf{Bedrock IAM scope.} \texttt{bedrock:InvokeModel} is currently \texttt{Resource = "*"}. It could be narrowed to the configured inference profile ARN.
+  \item \textbf{New-account Bedrock quotas.} New AWS accounts in eu-west-1 have a low daily token cap. First-time testing can easily exhaust it; request a quota increase via Service Quotas before onboarding real traffic.
+\end{itemize}
+
+\section{Cost Snapshot}
+
+Back-of-envelope for a test that processes $N$ papers per day:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Lambda:} Free tier covers 1\,M invocations/month. This workload is well under that.
+  \item \textbf{DynamoDB on-demand:} \$1.25 per million write requests, \$0.25 per million reads. Trivial at this volume.
+  \item \textbf{SQS:} First 1\,M requests/month are free.
+  \item \textbf{S3:} \$0.023 per GB-month. One MP3 is ${\approx}$200\,KB; 30 papers/day = ${\approx}$6\,MB/day.
+  \item \textbf{Bedrock (Claude 3 Haiku):} ${\approx}$\$0.0006 per paper.
+  \item \textbf{Polly (neural):} \$16 per 1\,M characters, so ${\approx}$\$0.005 per summary.
+  \item \textbf{NAT Gateway:} Flat ${\approx}$\$0.048/hour in eu-west-1, so ${\approx}$\$35/month whether idle or busy. This dominates the running cost; destroy the stack when not testing.
+  \item \textbf{VPC interface endpoints:} ${\approx}$\$0.011/hour each, two of them ${\approx}$\$16/month. The DynamoDB Gateway endpoint is free.
+\end{itemize}
+
+The fixed VPC costs (NAT + interface endpoints) make this stack expensive to leave idle. For pure testing, a NAT-less ``Mode A'' variant (no VPC, Lambdas on the public AWS network, DynamoDB over public endpoints) can be created by removing \texttt{vpc\_config} from the Lambdas and deleting \texttt{vpc.tf} / \texttt{networking.tf}; cost drops to effectively zero when idle.
+
+\section{Summary}
+
+Every piece of back-end logic lives in one of four Lambdas, every piece of state lives in DynamoDB or S3, and every interaction is mediated by either SQS (for asynchronous work) or EventBridge (for scheduling). The entire stack is reproducible from \texttt{infra/} with \texttt{./build.sh \&\& terraform apply}, and removable with \texttt{terraform destroy}. The design is deliberately boring: no custom infrastructure code, no cross-account trickery, no hand-rolled retries --- just AWS primitives wired together so that each component can be reasoned about, replaced, or scaled independently.
+
+\end{document}

@@ -1,8 +1,8 @@
-import { connectToDatabase } from "../shared/db.js";
-import Paper from "./models/paper.model.js";
+import { QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { ddb } from "./shared/dynamo.js";
 import {
   BedrockRuntimeClient,
-  InvokeModelCommand,
+  ConverseCommand,
 } from "@aws-sdk/client-bedrock-runtime";
 import { PollyClient, SynthesizeSpeechCommand } from "@aws-sdk/client-polly";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -15,24 +15,18 @@ const generateAISummary = async (paper) => {
   const prompt = `Summarize this AI paper in 3-4 simple sentences:
 
 Title: ${paper.title}
-Topics: ${paper.topic.join(", ")}
+Topic: ${paper.topic}
 Abstract: ${paper.summary}`;
 
   const response = await bedrock.send(
-    new InvokeModelCommand({
+    new ConverseCommand({
       modelId: process.env.BEDROCK_MODEL_ID,
-      contentType: "application/json",
-      accept: "application/json",
-      body: JSON.stringify({
-        anthropic_version: "bedrock-2023-05-31",
-        max_tokens: 300,
-        messages: [{ role: "user", content: prompt }],
-      }),
+      messages: [{ role: "user", content: [{ text: prompt }] }],
+      inferenceConfig: { maxTokens: 300, temperature: 0.5 },
     })
   );
 
-  const result = JSON.parse(new TextDecoder().decode(response.body));
-  return result.content[0].text.trim();
+  return response.output.message.content[0].text.trim();
 };
 
 const generateAudio = async (text) => {
@@ -52,8 +46,9 @@ const generateAudio = async (text) => {
   return Buffer.concat(chunks);
 };
 
-const uploadToS3 = async (buffer, paperId) => {
-  const key = `audio/${paperId}.mp3`;
+const uploadToS3 = async (buffer, externalId) => {
+  const safeId = externalId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const key = `audio/${safeId}.mp3`;
 
   await s3.send(
     new PutObjectCommand({
@@ -67,31 +62,51 @@ const uploadToS3 = async (buffer, paperId) => {
   return `https://${process.env.S3_BUCKET}.s3.amazonaws.com/${key}`;
 };
 
+const findUnprocessedPapers = async (topic, limit) => {
+  const response = await ddb.send(
+    new QueryCommand({
+      TableName: process.env.PAPERS_TABLE,
+      IndexName: "topic-createdAt-index",
+      KeyConditionExpression: "#t = :t",
+      FilterExpression: "attribute_not_exists(audioUrl)",
+      ExpressionAttributeNames: { "#t": "topic" },
+      ExpressionAttributeValues: { ":t": topic },
+      ScanIndexForward: false,
+      Limit: Math.max(limit * 3, 30),
+    })
+  );
+
+  return (response.Items ?? []).slice(0, limit);
+};
+
 export const handler = async (event, context) => {
   context.callbackWaitsForEmptyEventLoop = false;
 
-  await connectToDatabase();
-
   for (const record of event.Records) {
     const message = JSON.parse(record.body);
-
-    const papers = await Paper.find({
-      topic: message.topic,
-      $or: [
-        { audioUrl: { $exists: false } },
-        { audioUrl: "" },
-      ],
-    }).limit(message.insertedCount || 10);
+    const papers = await findUnprocessedPapers(
+      message.topic,
+      message.insertedCount || 10
+    );
 
     for (const paper of papers) {
-      const summary = await generateAISummary(paper);
-      const audio = await generateAudio(summary);
-      const audioUrl = await uploadToS3(audio, paper._id);
+      if (paper.audioUrl) continue;
 
-      await Paper.findByIdAndUpdate(paper._id, {
-        summary,
-        audioUrl,
-      });
+      const aiSummary = await generateAISummary(paper);
+      const audio = await generateAudio(aiSummary);
+      const audioUrl = await uploadToS3(audio, paper.externalId);
+
+      await ddb.send(
+        new UpdateCommand({
+          TableName: process.env.PAPERS_TABLE,
+          Key: { externalId: paper.externalId },
+          UpdateExpression: "SET aiSummary = :s, audioUrl = :u",
+          ExpressionAttributeValues: {
+            ":s": aiSummary,
+            ":u": audioUrl,
+          },
+        })
+      );
     }
   }
 

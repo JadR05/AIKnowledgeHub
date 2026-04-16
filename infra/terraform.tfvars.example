@@ -1,21 +1,10 @@
-aws_region = "us-east-1"
+aws_region = "eu-west-1"
 
 project_name = "aikhub"
 
-mongodb_uri = "your-mongodb-uri-here"
+ses_sender_email = "muhammad.kobeissi@gmail.com"
 
-ses_sender_email = "your-verified-email@example.com"
-
-bedrock_model_id = "anthropic.claude-3-sonnet-20240229-v1:0"
-
-vpc_id = "vpc-xxxxxxxx"
-
-private_subnet_ids = [
-  "subnet-xxxxxxxx",
-  "subnet-yyyyyyyy"
-]
-
-lambda_security_group_id = "sg-xxxxxxxx"
+bedrock_model_id = "eu.anthropic.claude-3-haiku-20240307-v1:0"
 
 tags = {
   Project = "AIKnowledgeHub"

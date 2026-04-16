@@ -25,3 +25,16 @@ output "email_queue_url" {
 output "s3_bucket_name" {
   value = aws_s3_bucket.audio_bucket.id
 }
+
+output "nat_gateway_eip" {
+  description = "Public IP of NAT gateway (for external service whitelisting)"
+  value       = aws_eip.nat.public_ip
+}
+
+output "papers_table_name" {
+  value = aws_dynamodb_table.papers.name
+}
+
+output "subscriptions_table_name" {
+  value = aws_dynamodb_table.subscriptions.name
+}

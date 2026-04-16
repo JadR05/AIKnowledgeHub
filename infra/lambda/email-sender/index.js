@@ -5,6 +5,9 @@ const ses = new SESClient({});
 export const handler = async (event) => {
   const results = [];
 
+  const topicList = (p) =>
+    (Array.isArray(p.topics) ? p.topics : [p.topic]).filter(Boolean).join(", ");
+
   for (const record of event.Records) {
     const { email, papers, subscribedTopics } = JSON.parse(record.body);
 
@@ -13,7 +16,7 @@ export const handler = async (event) => {
         .map(
           (p, i) =>
             `${i + 1}. ${p.title}\n` +
-            `   Topics: ${p.topic.join(", ")}\n` +
+            `   Topics: ${topicList(p)}\n` +
             `   ${p.summary.slice(0, 200)}...\n` +
             `   PDF: ${p.pdfUrl || "Not available"}\n`
         )
@@ -31,7 +34,7 @@ export const handler = async (event) => {
             (p) =>
               `<div style="margin-bottom:20px;">` +
               `<h3>${p.title}</h3>` +
-              `<p><em>${p.topic.join(", ")}</em></p>` +
+              `<p><em>${topicList(p)}</em></p>` +
               `<p>${p.summary.slice(0, 300)}...</p>` +
               (p.pdfUrl ? `<a href="${p.pdfUrl}">Read PDF</a>` : "") +
               `</div>`

@@ -1,4 +1,3 @@
-import { connectToDatabase } from "../shared/db.js";
 import { runScraper } from "./services/scraper.service.js";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 
@@ -8,8 +7,6 @@ export const handler = async (event, context) => {
   context.callbackWaitsForEmptyEventLoop = false;
 
   try {
-    await connectToDatabase();
-
     const results = await runScraper();
 
     const queueUrl = process.env.PAPER_QUEUE_URL;

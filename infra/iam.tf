@@ -81,6 +81,24 @@ resource "aws_iam_role_policy" "lambda_permissions" {
           "ec2:DeleteNetworkInterface"
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:Scan",
+          "dynamodb:BatchGetItem",
+          "dynamodb:BatchWriteItem"
+        ]
+        Resource = [
+          aws_dynamodb_table.papers.arn,
+          "${aws_dynamodb_table.papers.arn}/index/*",
+          aws_dynamodb_table.subscriptions.arn
+        ]
       }
     ]
   })
