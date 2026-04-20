@@ -252,11 +252,11 @@ function HomePage({ navigate }) {
           {papers.length > 0 ? (
             <div className="paper-grid">
               {papers.map((paper) => {
-                const paperPath = `/papers/${paper._id}`
+                const paperPath = `/papers/${paper.paper_id}`
 
                 return (
                   <a
-                    key={paper._id}
+                    key={paper.paper_id}
                     href={paperPath}
                     className="paper-card"
                     onClick={(event) =>
@@ -274,8 +274,8 @@ function HomePage({ navigate }) {
                     </p>
 
                     <div className="topic-list">
-                      {normalizeTopics(paper.topic).map((topic) => (
-                        <span key={`${paper._id}-${topic}`} className="topic-pill">
+                      {normalizeTopics(paper.topics).map((topic) => (
+                        <span key={`${paper.paper_id}-${topic}`} className="topic-pill">
                           {topic}
                         </span>
                       ))}
@@ -418,14 +418,10 @@ function PaperDetailsPage({ paperId, navigate }) {
             <div className="detail-hero__content">
               <div className="eyebrow">Paper page</div>
               <h1>{paper.title}</h1>
-              <p className="detail-hero__lead">
-                A dedicated reading view for the selected paper, connected to the
-                backend paper route.
-              </p>
 
               <div className="topic-list">
-                {normalizeTopics(paper.topic).map((topic) => (
-                  <span key={`${paper._id}-${topic}`} className="topic-pill">
+                {normalizeTopics(paper.topics).map((topic) => (
+                  <span key={`${paper.paper_id}-${topic}`} className="topic-pill">
                     {topic}
                   </span>
                 ))}

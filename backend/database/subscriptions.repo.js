@@ -1,6 +1,6 @@
-import dynamo from "./dynamo.js";
-import { ScanCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { SUBSCRIPTIONS_TABLE } from "../config/env.js";
+import dynamo from "./dynamodb.js";
+import {PutCommand} from "@aws-sdk/lib-dynamodb";
+import {SUBSCRIPTIONS_TABLE} from "../config/env.js";
 
 export const createSubscription = async ({ email, topics }) => {
   const item = {

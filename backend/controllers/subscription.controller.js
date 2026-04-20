@@ -1,8 +1,8 @@
-import {createSubscription} from "../db/subscriptions.repo.js";
+import { createSubscription } from "../database/subscriptions.repo.js";
 
 export const subscribeUser = async (req, res, next) => {
   try {
-    const { email, subscribedTopics } = req.body;
+    const {email, subscribedTopics} = req.body;
 
     if (!email || !subscribedTopics?.length) {
       const error = new Error("Email and at least one topic are required");
@@ -10,12 +10,15 @@ export const subscribeUser = async (req, res, next) => {
       throw error;
     }
 
-    const newUser = await createSubscription({email, topics: subscribedTopics});
+    const newUser = await createSubscription({
+      email: email.trim().toLowerCase(),
+      topics: subscribedTopics
+    });
 
     res.status(201).json({
       success: true,
       message: "Subscription created successfully",
-      subscription: newUser 
+      subscription: newUser
     });
   } catch (error) {
     next(error);
