@@ -1,6 +1,6 @@
 import { startTransition, useDeferredValue, useEffect, useState } from 'react'
 import './App.css'
-import { createSubscription, getPaperById, getPapers } from './api'
+import { createSubscription, getPaperById, getPapers} from './api'
 import { TOPIC_OPTIONS } from './constants'
 
 const PAPER_ROUTE_PATTERN = /^\/papers\/([^/]+)\/?$/
@@ -174,20 +174,20 @@ function HomePage({ navigate }) {
         <div className="hero-panel__stats">
           <div className="stat-card">
             <span className="stat-card__label">Reading flow</span>
-            <strong>Home →  paper page</strong>
-            <p>Each card opens a dedicated route so the user can read the paper details.</p>
+            <strong>Clean reading experience</strong>
+            <p>Click any paper to open a distraction-free reading page with full details.</p>
           </div>
           <div className="stat-card">
-            <span className="stat-card__label">Filters</span>
+            <span className="stat-card__label">Topic filters</span>
             <strong>
               {hasActiveFilters ? `${selectedTopics.length} topic filters active` : 'All topics'}
             </strong>
-            <p>The homepage reuses the same backend papers route for listing and filtering.</p>
+            <p>Filter papers by research area in one click.</p>
           </div>
           <div className="stat-card">
             <span className="stat-card__label">Subscriptions</span>
-            <strong>Email + multiple topics</strong>
-            <p>The subscribe form sends the email and selected topics to the subscriptions route.</p>
+            <strong>Personalized updates</strong>
+            <p>Get notified when new research matches your selected topics.</p>
           </div>
         </div>
       </section>
@@ -252,11 +252,11 @@ function HomePage({ navigate }) {
           {papers.length > 0 ? (
             <div className="paper-grid">
               {papers.map((paper) => {
-                const paperPath = `/papers/${paper._id}`
+                const paperPath = `/papers/${paper.paper_id}`
 
                 return (
                   <a
-                    key={paper._id}
+                    key={paper.paper_id}
                     href={paperPath}
                     className="paper-card"
                     onClick={(event) =>
@@ -265,7 +265,6 @@ function HomePage({ navigate }) {
                   >
                     <div className="paper-card__meta">
                       <span>{formatDate(paper.publishedAt ?? paper.createdAt)}</span>
-                      <span>{paper.views ?? 0} views</span>
                     </div>
 
                     <h3>{paper.title}</h3>
@@ -275,8 +274,8 @@ function HomePage({ navigate }) {
                     </p>
 
                     <div className="topic-list">
-                      {normalizeTopics(paper.topic).map((topic) => (
-                        <span key={`${paper._id}-${topic}`} className="topic-pill">
+                      {normalizeTopics(paper.topics).map((topic) => (
+                        <span key={`${paper.paper_id}-${topic}`} className="topic-pill">
                           {topic}
                         </span>
                       ))}
@@ -419,14 +418,10 @@ function PaperDetailsPage({ paperId, navigate }) {
             <div className="detail-hero__content">
               <div className="eyebrow">Paper page</div>
               <h1>{paper.title}</h1>
-              <p className="detail-hero__lead">
-                A dedicated reading view for the selected paper, connected to the
-                backend paper route.
-              </p>
 
               <div className="topic-list">
-                {normalizeTopics(paper.topic).map((topic) => (
-                  <span key={`${paper._id}-${topic}`} className="topic-pill">
+                {normalizeTopics(paper.topics).map((topic) => (
+                  <span key={`${paper.paper_id}-${topic}`} className="topic-pill">
                     {topic}
                   </span>
                 ))}
@@ -465,10 +460,6 @@ function PaperDetailsPage({ paperId, navigate }) {
               <div className="metric-row">
                 <span>Published</span>
                 <strong>{formatDate(paper.publishedAt ?? paper.createdAt)}</strong>
-              </div>
-              <div className="metric-row">
-                <span>Views</span>
-                <strong>{paper.views ?? 0}</strong>
               </div>
               <div className="metric-row">
                 <span>External ID</span>
