@@ -74,6 +74,7 @@ resource "aws_lambda_function" "email_sender" {
   environment {
     variables = {
       SES_SENDER_EMAIL = var.ses_sender_email
+      S3_BUCKET        = aws_s3_bucket.audio_bucket.id
     }
   }
 

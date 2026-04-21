@@ -27,7 +27,7 @@ const queryPapersForTopic = async (topic, since) => {
 };
 
 const getPapersForUser = async (user) => {
-  const topics = user.subscribedTopics || [];
+  const topics = user.topics || [];
   const since = user.lastEmailSent || null;
 
   const perTopic = await Promise.all(
@@ -71,7 +71,7 @@ export const handler = async (event, context) => {
         topic: p.topic,
         summary: (p.plainLanguageSummary || p.summary || "").slice(0, 500), // prefers plainLanguageSummary (LLM-generated), falls back to original arXiv abstract
         pdfUrl: p.pdfUrl,
-        audioUrl: p.audioUrl,
+        audioKey: p.audioKey,
       }));
 
       await sqs.send(
@@ -79,7 +79,7 @@ export const handler = async (event, context) => {
           QueueUrl: process.env.EMAIL_QUEUE_URL,
           MessageBody: JSON.stringify({
             email: user.email,
-            subscribedTopics: user.subscribedTopics,
+            topics: user.topics,
             papers: slim,
           }),
         })

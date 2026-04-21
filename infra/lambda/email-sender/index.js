@@ -7,19 +7,16 @@ const s3 = new S3Client({});
 
 const AUDIO_URL_TTL_SECONDS = 7 * 24 * 60 * 60;
 
-const presignAudio = async (audioUrl) => {
-  if (!audioUrl) return null;
+const presignAudio = async (audioKey) => {
+  if (!audioKey) return null;
   try {
-    const u = new URL(audioUrl);
-    const bucket = u.hostname.split(".")[0];
-    const key = decodeURIComponent(u.pathname.replace(/^\//, ""));
     return await getSignedUrl(
       s3,
-      new GetObjectCommand({ Bucket: bucket, Key: key }),
+      new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: audioKey }),
       { expiresIn: AUDIO_URL_TTL_SECONDS }
     );
   } catch (err) {
-    console.error(`presign failed for ${audioUrl}: ${err.message}`);
+    console.error(`presign failed for ${audioKey}: ${err.message}`);
     return null;
   }
 };
@@ -31,11 +28,11 @@ export const handler = async (event) => {
     (Array.isArray(p.topics) ? p.topics : [p.topic]).filter(Boolean).join(", ");
 
   for (const record of event.Records) {
-    const { email, papers, subscribedTopics } = JSON.parse(record.body);
+    const { email, papers, topics } = JSON.parse(record.body);
 
     try {
       const papersWithAudio = await Promise.all(
-        papers.map(async (p) => ({ ...p, signedAudioUrl: await presignAudio(p.audioUrl) }))
+        papers.map(async (p) => ({ ...p, signedAudioUrl: await presignAudio(p.audioKey) }))
       );
 
       const paperList = papersWithAudio
@@ -51,11 +48,11 @@ export const handler = async (event) => {
 
       const textBody =
         `Hi there!\n\nHere are the latest AI research papers matching your topics ` +
-        `(${subscribedTopics.join(", ")}):\n\n${paperList}\n---\nAIKnowledgeHub`;
+        `(${topics.join(", ")}):\n\n${paperList}\n---\nAIKnowledgeHub`;
 
       const htmlBody =
         `<h2>Your AI Research Update</h2>` +
-        `<p>Topics: <strong>${subscribedTopics.join(", ")}</strong></p><hr/>` +
+        `<p>Topics: <strong>${topics.join(", ")}</strong></p><hr/>` +
         papersWithAudio
           .map(
             (p) =>
@@ -76,7 +73,7 @@ export const handler = async (event) => {
           Destination: { ToAddresses: [email] },
           Message: {
             Subject: {
-              Data: `AIKnowledgeHub: ${papers.length} new papers in ${subscribedTopics.join(", ")}`,
+              Data: `AIKnowledgeHub: ${papers.length} new papers in ${topics.join(", ")}`,
               Charset: "UTF-8",
             },
             Body: {

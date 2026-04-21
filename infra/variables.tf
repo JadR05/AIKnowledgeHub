@@ -18,7 +18,13 @@ variable "ses_sender_email" {
 variable "bedrock_model_id" {
   description = "Bedrock model used for paper summaries"
   type        = string
-  default     = "eu.anthropic.claude-3-haiku-20240307-v1:0"
+  default     = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+}
+
+variable "ec2_instance_type" {
+  description = "EC2 instance type for the application servers"
+  type        = string
+  default     = "t3.micro"
 }
 
 variable "tags" {

@@ -38,3 +38,18 @@ output "papers_table_name" {
 output "subscriptions_table_name" {
   value = aws_dynamodb_table.subscriptions.name
 }
+
+output "alb_dns_name" {
+  description = "Public DNS for the ALB — open in browser to reach the app"
+  value       = aws_lb.app.dns_name
+}
+
+output "ecr_backend_url" {
+  description = "Push backend image here"
+  value       = aws_ecr_repository.backend.repository_url
+}
+
+output "ecr_frontend_url" {
+  description = "Push frontend image here"
+  value       = aws_ecr_repository.frontend.repository_url
+}
