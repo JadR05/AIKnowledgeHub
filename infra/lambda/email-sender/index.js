@@ -1,6 +1,28 @@
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const ses = new SESClient({});
+const s3 = new S3Client({});
+
+const AUDIO_URL_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+const presignAudio = async (audioUrl) => {
+  if (!audioUrl) return null;
+  try {
+    const u = new URL(audioUrl);
+    const bucket = u.hostname.split(".")[0];
+    const key = decodeURIComponent(u.pathname.replace(/^\//, ""));
+    return await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: bucket, Key: key }),
+      { expiresIn: AUDIO_URL_TTL_SECONDS }
+    );
+  } catch (err) {
+    console.error(`presign failed for ${audioUrl}: ${err.message}`);
+    return null;
+  }
+};
 
 export const handler = async (event) => {
   const results = [];
@@ -12,13 +34,18 @@ export const handler = async (event) => {
     const { email, papers, subscribedTopics } = JSON.parse(record.body);
 
     try {
-      const paperList = papers
+      const papersWithAudio = await Promise.all(
+        papers.map(async (p) => ({ ...p, signedAudioUrl: await presignAudio(p.audioUrl) }))
+      );
+
+      const paperList = papersWithAudio
         .map(
           (p, i) =>
             `${i + 1}. ${p.title}\n` +
             `   Topics: ${topicList(p)}\n` +
             `   ${p.summary.slice(0, 200)}...\n` +
-            `   PDF: ${p.pdfUrl || "Not available"}\n`
+            `   PDF: ${p.pdfUrl || "Not available"}\n` +
+            (p.signedAudioUrl ? `   Audio: ${p.signedAudioUrl}\n` : "")
         )
         .join("\n");
 
@@ -29,7 +56,7 @@ export const handler = async (event) => {
       const htmlBody =
         `<h2>Your AI Research Update</h2>` +
         `<p>Topics: <strong>${subscribedTopics.join(", ")}</strong></p><hr/>` +
-        papers
+        papersWithAudio
           .map(
             (p) =>
               `<div style="margin-bottom:20px;">` +
@@ -37,10 +64,11 @@ export const handler = async (event) => {
               `<p><em>${topicList(p)}</em></p>` +
               `<p>${p.summary.slice(0, 300)}...</p>` +
               (p.pdfUrl ? `<a href="${p.pdfUrl}">Read PDF</a>` : "") +
+              (p.signedAudioUrl ? ` &middot; <a href="${p.signedAudioUrl}">Listen (audio)</a>` : "") +
               `</div>`
           )
           .join("") +
-        `<hr/><p style="color:#888;">AIKnowledgeHub</p>`;
+        `<hr/><p style="color:#888;">AIKnowledgeHub &middot; audio links expire in 7 days</p>`;
 
       await ses.send(
         new SendEmailCommand({

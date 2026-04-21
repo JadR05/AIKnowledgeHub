@@ -42,7 +42,7 @@ const getPapersForUser = async (user) => {
     );
     papers = fallback
       .flat()
-      .sort((a, b) => (b.views || 0) - (a.views || 0))
+      .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))
       .slice(0, 5);
   }
 
@@ -58,7 +58,7 @@ export const handler = async (event, context) => {
     );
     const users = scan.Items ?? [];
 
-    const MAX_PAPERS_PER_EMAIL = 20;
+    const MAX_PAPERS_PER_EMAIL = 5;
 
     for (const user of users) {
       const papers = await getPapersForUser(user);
@@ -69,8 +69,9 @@ export const handler = async (event, context) => {
         externalId: p.externalId,
         title: p.title,
         topic: p.topic,
-        summary: (p.aiSummary || p.summary || "").slice(0, 500),
+        summary: (p.plainLanguageSummary || p.summary || "").slice(0, 500), // prefers plainLanguageSummary (LLM-generated), falls back to original arXiv abstract
         pdfUrl: p.pdfUrl,
+        audioUrl: p.audioUrl,
       }));
 
       await sqs.send(
@@ -88,7 +89,7 @@ export const handler = async (event, context) => {
         new UpdateCommand({
           TableName: process.env.SUBSCRIPTIONS_TABLE,
           Key: { email: user.email },
-          UpdateExpression: "SET lastEmailSent = :t",
+          UpdateExpression: "SET lastEmailSent = :t, createdAt = if_not_exists(createdAt, :t)",
           ExpressionAttributeValues: { ":t": new Date().toISOString() },
         })
       );

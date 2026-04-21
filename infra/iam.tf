@@ -61,6 +61,14 @@ resource "aws_iam_role_policy" "lambda_permissions" {
       {
         Effect = "Allow"
         Action = [
+          "aws-marketplace:ViewSubscriptions",
+          "aws-marketplace:Subscribe"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "polly:SynthesizeSpeech"
         ]
         Resource = "*"

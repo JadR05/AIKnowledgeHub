@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { XMLParser } from "fast-xml-parser";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import { ddb } from "../shared/dynamo.js";
@@ -33,18 +34,18 @@ export const runScraper = async () => {
       const pdfUrl = pdfLink ? pdfLink["@_href"] : null;
 
       return {
+        paperID_UUID: randomUUID(),
         externalId,
         title: entry.title?.trim(),
         topic: topicName,
         topics: [topicName],
-        summary: entry.summary?.trim(),
+        summary: entry.summary?.trim(), // original arXiv abstract — technical, academic language
         pdfUrl,
         source: "arXiv",
         publishedAt: entry.published
           ? new Date(entry.published).toISOString()
           : null,
         createdAt: new Date().toISOString(),
-        views: 0,
       };
     });
 
