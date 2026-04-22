@@ -34,11 +34,11 @@ export const fetchPapers = async ({ topics = [], limit = 10 }) => {
   return papers.slice(0, safeLimit);
 };
 
-export const fetchPaperById = async (paper_id) => {
+export const fetchPaperById = async (externalId) => {
   const result = await dynamo.send(
     new GetCommand({
       TableName: PAPERS_TABLE,
-      Key: { paper_id },
+      Key: { externalId },
     })
   );
 

@@ -252,11 +252,11 @@ function HomePage({ navigate }) {
           {papers.length > 0 ? (
             <div className="paper-grid">
               {papers.map((paper) => {
-                const paperPath = `/papers/${paper.paper_id}`
+                const paperPath = `/papers/${paper.externalId}`
 
                 return (
                   <a
-                    key={paper.paper_id}
+                    key={paper.externalId}
                     href={paperPath}
                     className="paper-card"
                     onClick={(event) =>
@@ -270,12 +270,12 @@ function HomePage({ navigate }) {
                     <h3>{paper.title}</h3>
 
                     <p className="paper-card__summary">
-                      {truncateText(paper.summary)}
+                      {truncateText(paper.plainLanguageSummary)}
                     </p>
 
                     <div className="topic-list">
                       {normalizeTopics(paper.topics).map((topic) => (
-                        <span key={`${paper.paper_id}-${topic}`} className="topic-pill">
+                        <span key={`${paper.externalId}-${topic}`} className="topic-pill">
                           {topic}
                         </span>
                       ))}
@@ -421,7 +421,7 @@ function PaperDetailsPage({ paperId, navigate }) {
 
               <div className="topic-list">
                 {normalizeTopics(paper.topics).map((topic) => (
-                  <span key={`${paper.paper_id}-${topic}`} className="topic-pill">
+                  <span key={`${paper.externalId}-${topic}`} className="topic-pill">
                     {topic}
                   </span>
                 ))}
@@ -477,7 +477,7 @@ function PaperDetailsPage({ paperId, navigate }) {
                 </div>
               </div>
               <p className="detail-card__body">
-                {paper.summary || 'No summary is available for this paper yet.'}
+                {paper.plainLanguageSummary || 'No summary is available for this paper yet.'}
               </p>
             </article>
 

@@ -35,6 +35,7 @@ EXPOSE 80
 
 # Copy entrypoint that injects BACKEND_HOST at runtime
 COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+# Strip Windows CRLF (in case the file was checked out with crlf line endings) + make executable
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
