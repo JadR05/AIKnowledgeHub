@@ -270,7 +270,7 @@ function HomePage({ navigate }) {
                     <h3>{paper.title}</h3>
 
                     <p className="paper-card__summary">
-                      {truncateText(paper.summary)}
+                      {truncateText(paper.plainLanguageSummary)}
                     </p>
 
                     <div className="topic-list">
@@ -477,7 +477,7 @@ function PaperDetailsPage({ paperId, navigate }) {
                 </div>
               </div>
               <p className="detail-card__body">
-                {paper.summary || 'No summary is available for this paper yet.'}
+                {paper.plainLanguageSummary || 'No summary is available for this paper yet.'}
               </p>
             </article>
 
