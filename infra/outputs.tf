@@ -53,3 +53,8 @@ output "ecr_frontend_url" {
   description = "Push frontend image here"
   value       = aws_ecr_repository.frontend.repository_url
 }
+
+output "cloudfront_url" {
+  description = "HTTPS URL — use this for the demo"
+  value       = "https://${aws_cloudfront_distribution.app.domain_name}"
+}

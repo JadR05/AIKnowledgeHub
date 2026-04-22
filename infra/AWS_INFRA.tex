@@ -811,8 +811,261 @@ Back-of-envelope for a test that processes $N$ papers per day:
 
 The fixed VPC costs (NAT + interface endpoints) make this stack expensive to leave idle. For pure testing, a NAT-less ``Mode A'' variant (no VPC, Lambdas on the public AWS network, DynamoDB over public endpoints) can be created by removing \texttt{vpc\_config} from the Lambdas and deleting \texttt{vpc.tf} / \texttt{networking.tf}; cost drops to effectively zero when idle.
 
+\section{Post-Launch Updates}
+
+The sections above describe the initial deployment. Between the first
+\texttt{terraform apply} and the production demo, several additions and
+refactors were made. This section captures them. Where it disagrees with
+an earlier chapter, this one is authoritative.
+
+\subsection{New: Public compute layer (EC2 + ALB + ASG + ECR)}
+
+The front-end was originally served from the old Express host; for the
+production deploy a fully managed compute tier was added and codified in
+Terraform.
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{\texttt{ecr.tf}} --- two Elastic Container Registry
+        repositories (\texttt{aikhub-backend}, \texttt{aikhub-frontend})
+        each with a lifecycle policy that retains the last five images.
+  \item \textbf{\texttt{ec2.tf}} --- Launch Template (Amazon Linux 2023,
+        \texttt{t3.micro}, public-IP disabled), an Auto Scaling Group
+        (\texttt{desired=2}, \texttt{min=1}, \texttt{max=4}) spanning the
+        two private subnets, an internet-facing Application Load
+        Balancer, a target group with ELB health checks, and a
+        \texttt{forward} listener on HTTP:80.
+  \item User-data on each instance installs Docker, logs in to ECR via
+        the instance profile, and pulls the backend + frontend images.
+        Nginx in the frontend container reverse-proxies API traffic to
+        the backend container.
+  \item An ASG \emph{instance refresh} is configured (rolling, min 50\%
+        healthy) so that pushing a new image tag and starting a refresh
+        is enough to roll out updated code without manual intervention.
+  \item The EC2 IAM role gets both \texttt{AmazonEC2ContainerRegistryReadOnly}
+        and \texttt{AmazonSSMManagedInstanceCore} attached --- the latter
+        lets operators shell into private-subnet instances through
+        Systems Manager Session Manager, avoiding bastion hosts.
+\end{itemize}
+
+\subsection{New: HTTPS via CloudFront (\texttt{cloudfront.tf})}
+
+The ALB only listens on HTTP:80; terminating TLS directly on the ALB
+requires a cert for a hostname the account controls. To get browser-trusted
+HTTPS without buying a domain, a CloudFront distribution was placed in
+front of the ALB:
+
+\begin{itemize}[leftmargin=*]
+  \item Origin: \texttt{aws\_lb.app.dns\_name}, \texttt{origin\_protocol\_policy = "http-only"}.
+  \item Default behaviour: \texttt{redirect-to-https}, all HTTP methods
+        forwarded, compression enabled.
+  \item AWS managed policies: \texttt{CachingDisabled} (dynamic API, no
+        caching) and \texttt{AllViewerExceptHostHeader} (forward
+        everything except \texttt{Host} to avoid confusing the ALB's
+        host-based routing).
+  \item \texttt{cloudfront\_default\_certificate = true} --- the
+        distribution inherits the \texttt{*.cloudfront.net} cert, so no
+        ACM work and no domain purchase are required.
+  \item Output: \texttt{cloudfront\_url} --- the canonical public URL
+        used for demos.
+\end{itemize}
+
+Trade-off: the cloudfront.net hostname is ugly. When a custom domain is
+later added, the same distribution can be re-pointed to a Route 53 record
+with an ACM cert; none of the downstream wiring changes.
+
+\subsection{Changed: S3 bucket name is account-portable}
+
+Bucket: \texttt{aikhub-audio-summaries-\$\{aws\_caller\_identity.account\_id\}}
+(previously just \texttt{aikhub-audio-summaries}).
+
+Rationale: S3 bucket names are a global namespace, and after a delete
+AWS reserves the name for up to an hour. During the account migration
+(see below) this blocked \texttt{terraform apply} for 19+ minutes until
+the name was freed. Suffixing the bucket name with the account ID makes
+every deploy unique and immune to this lock.
+
+\subsection{Changed: Bedrock model upgraded to Claude Haiku 4.5}
+
+\begin{itemize}[leftmargin=*]
+  \item Was: \texttt{eu.anthropic.claude-3-haiku-20240307-v1:0}
+        (flagged as \emph{Legacy} by Anthropic; returns
+        \texttt{ResourceNotFoundException} on accounts that haven't used
+        it in the last 30 days).
+  \item Now: \texttt{eu.anthropic.claude-haiku-4-5-20251001-v1:0}.
+  \item Prerequisite: the Anthropic \emph{use-case details} form must be
+        submitted once per account through Bedrock $\to$ Model access
+        $\to$ ``Submit use case details''. Applies to every Anthropic
+        model; without it all Claude calls fail with
+        ``Model use case details have not been submitted''.
+\end{itemize}
+
+\subsection{Changed: Audio storage uses object keys, not full URLs}
+
+The \texttt{aikhub-papers} table now has an \texttt{audioKey} attribute
+holding the S3 object key (e.g.\ \texttt{audio/2604.12911v1.mp3}) instead
+of a full \texttt{audioUrl}. The email-sender Lambda reads
+\texttt{S3\_BUCKET} from its environment and calls
+\texttt{getSignedUrl(GetObjectCommand)} to mint a time-limited
+pre-signed URL just before sending, with a TTL of seven days.
+
+This replaces the previous scheme where emails linked to
+\texttt{https://<bucket>.s3.amazonaws.com/...} URLs that 403'd because the
+bucket blocks public access. The old ``S3 audio links are private''
+entry under \textbf{Known Limitations} is now closed.
+
+\subsection{Changed: Schema field renames}
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{aikhub-subscriptions.subscribedTopics} $\rightarrow$
+        \texttt{topics}.
+  \item Front-end \texttt{paper.paper\_id} $\rightarrow$
+        \texttt{paper.externalId} (matches the DynamoDB PK; fixed
+        \texttt{/papers/undefined} navigation).
+  \item Backend \texttt{fetchPaperById(paper\_id)} $\rightarrow$
+        \texttt{fetchPaperById(externalId)}.
+\end{itemize}
+
+One-shot migration scripts in \texttt{infra/scripts/} handled rewriting
+the existing rows:
+\texttt{add-paperids.mjs}, \texttt{backfill-schema.mjs},
+\texttt{remove-old-paperid.mjs}.
+
+\subsection{New: S3 Gateway VPC endpoint}
+
+Added a second Gateway endpoint (\texttt{com.amazonaws.<region>.s3})
+attached to the private route table. Private-subnet Lambdas now write
+audio to S3 over the private backbone --- no NAT bandwidth, no egress
+charges. DynamoDB and S3 are now both reached via free Gateway
+endpoints.
+
+\subsection{New: Frontend Dockerfile hardening}
+
+The frontend image now runs \texttt{sed -i 's/\textbackslash r\$//'} on
+\texttt{/docker-entrypoint.sh} before \texttt{chmod +x}. Without this
+line, a checkout on Windows (CRLF line endings) produces a container
+that crash-loops with \texttt{exec /docker-entrypoint.sh: no such file
+or directory}. This was the root cause of a multi-hour debugging
+session; the fix is one line and permanent.
+
+\subsection{New: \texttt{empty\_bucket.py}}
+
+A short boto3 script that deletes every object version + delete marker
+in the audio bucket and then removes the bucket itself. Run before
+\texttt{terraform destroy}: versioned buckets cannot be deleted while
+they hold any non-current versions, and the AWS CLI one-liner for this
+is fragile under Git Bash's JSON quoting rules.
+
+\subsection{Incidents and recovery notes}
+
+Captured here so future contributors don't spend the same evenings
+debugging them.
+
+\subsubsection*{Bedrock account-level quota = 0}
+
+The initial AWS account had an \emph{applied} quota of zero tokens/day
+for every Bedrock inference profile, with all ``Request increase'' paths
+greyed out. Because the quota is account-level trust scoring (not a
+per-model setting), no amount of model swapping fixes it. Remediation:
+the stack was migrated to a teammate's account. The destroy-then-reapply
+flow was rehearsed end-to-end and is reproducible from this document.
+
+\subsubsection*{SES sandbox blocks arbitrary recipients}
+
+Fresh accounts begin in SES sandbox, which requires \emph{both} sender
+and recipient to be verified. For the demo, individual recipient email
+addresses were verified through SES $\to$ Verified Identities. A
+production-access request via Support Center $\to$ ``Service limit
+increase'' $\to$ SES Sending Limits is the permanent fix; AWS typically
+approves within 24 hours.
+
+\subsubsection*{Wrong-account Terraform plan}
+
+If \texttt{AWS\_PROFILE} is unset in a new shell, \texttt{terraform plan}
+can read the default profile's credentials and show the entire stack as
+\emph{deleted outside Terraform} --- tempting a disastrous re-apply into
+the wrong account. Before any plan or apply, run
+\texttt{aws sts get-caller-identity} and confirm the \texttt{Account}
+field. Add \texttt{export AWS\_PROFILE=teammate} to
+\texttt{\textasciitilde/.bashrc} to make the correct profile sticky.
+
+\subsubsection*{Git Bash path mangling}
+
+Commands that pass log-group names starting with \texttt{/}
+(\texttt{/aws/lambda/aikhub-ai-processor}) are rewritten by MSYS into
+Windows paths (\texttt{C:/Program Files/Git/aws/lambda/...}). Prefix
+every such invocation with \texttt{MSYS\_NO\_PATHCONV=1}.
+
+\subsubsection*{\texttt{charmap} codec error on Windows}
+
+AWS CLI v2 on Windows fails to encode Unicode bytes returned by
+\texttt{aws ec2 get-console-output}. Workaround: use boto3 with an
+explicit \texttt{open(\ldots, encoding="utf-8")} when the output must
+be persisted.
+
+\subsection{Known Limitations --- updated}
+
+Resolved since the initial document:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{HTTPS}: now terminated at CloudFront.
+  \item \textbf{Private audio links}: now pre-signed with a 7-day TTL at
+        email-send time.
+\end{itemize}
+
+Still open:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Custom domain.} The public URL is still a
+        \texttt{*.cloudfront.net} hostname. Trivial to add: buy the
+        domain in Route 53, request an ACM cert in
+        \texttt{us-east-1} (CloudFront requires us-east-1 certs), attach
+        it to the distribution's \texttt{viewer\_certificate} block,
+        point an A-alias at the distribution.
+  \item \textbf{Unsubscribe flow.}
+  \item \textbf{CI/CD and CloudWatch alarms.}
+  \item \textbf{SES production access} (still in sandbox).
+  \item \textbf{Bedrock IAM scope} --- \texttt{Resource = "*"} could be
+        narrowed to the specific inference profile ARN.
+\end{itemize}
+
+\subsection{Updated cost snapshot}
+
+The managed-compute tier adds a predictable floor on top of the
+serverless costs documented earlier:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{NAT Gateway} --- $\approx$\$35/month (unchanged; still
+        the dominant fixed cost).
+  \item \textbf{VPC interface endpoints} --- $\approx$\$16/month for SQS
+        and SES. DynamoDB and S3 are Gateway endpoints and cost
+        nothing.
+  \item \textbf{ALB} --- $\approx$\$16/month base + per-LCU processing.
+  \item \textbf{2$\times$ EC2 \texttt{t3.micro}} --- $\approx$\$15/month
+        combined.
+  \item \textbf{CloudFront} --- free up to 1\,TB/month of egress on the
+        AWS Free Tier; after that \$0.085/GB. The distribution itself
+        is free.
+  \item \textbf{ECR} --- \$0.10/GB-month for stored images. With the
+        keep-last-five lifecycle, $\approx$\$0.50/month.
+\end{itemize}
+
+Back-of-envelope idle cost with the full stack up:
+\textbf{\$65--\$80/month}. Tear the stack down (\texttt{empty\_bucket.py}
+then \texttt{terraform destroy}) to drop to $\approx$\$0 when not
+demoing.
+
 \section{Summary}
 
-Every piece of back-end logic lives in one of four Lambdas, every piece of state lives in DynamoDB or S3, and every interaction is mediated by either SQS (for asynchronous work) or EventBridge (for scheduling). The entire stack is reproducible from \texttt{infra/} with \texttt{./build.sh \&\& terraform apply}, and removable with \texttt{terraform destroy}. The design is deliberately boring: no custom infrastructure code, no cross-account trickery, no hand-rolled retries --- just AWS primitives wired together so that each component can be reasoned about, replaced, or scaled independently.
+Every piece of back-end logic lives in one of four Lambdas, every piece
+of state lives in DynamoDB or S3, and every interaction is mediated by
+either SQS (for asynchronous work) or EventBridge (for scheduling).
+The front-end and its Express API are containerised and served from an
+auto-scaling EC2 fleet behind an Application Load Balancer, with public
+HTTPS provided by a CloudFront distribution that fronts the ALB. The
+entire stack --- serverless pipeline \emph{and} compute layer --- is
+reproducible from \texttt{infra/} with \texttt{./build.sh \&\&
+terraform apply}, and removable with \texttt{terraform destroy}
+(preceded by \texttt{empty\_bucket.py}). The design is deliberately
+boring: no custom infrastructure code, no cross-account trickery, no
+hand-rolled retries --- just AWS primitives wired together so that each
+component can be reasoned about, replaced, or scaled independently.
 
 \end{document}
