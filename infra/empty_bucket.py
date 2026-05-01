@@ -1,7 +1,7 @@
 import boto3
 
 s3 = boto3.client("s3", region_name="eu-west-1")
-bucket = "aikhub-audio-summaries"
+bucket = "aikhub-audio-summaries-010396039687"
 paginator = s3.get_paginator("list_object_versions")
 
 for page in paginator.paginate(Bucket=bucket):
